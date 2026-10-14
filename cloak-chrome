@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Launch CloakBrowser's patched Chromium as a standalone, manually-driven browser.
+# Each named profile gets its own directory (cookies, logins, extensions) and its
+# own pinned fingerprint seed, under <suite>/profiles/.
+#
+#   cloak-chrome                              # launch the "default" profile
+#   cloak-chrome --profile work               # launch (or create) "work"
+#   cloak-chrome --profile scraper-01 https://bot.incolumitas.com
+#   cloak-chrome --list-profiles              # show profiles + their seeds
+#   cloak-chrome --incognito                  # any extra Chromium flag passes through
+#   cloak-chrome --profile game11             # WM_CLASS="game11" (auto; --class=NAME overrides)
+#
+# The whole suite lives in one relocatable folder. Paths are derived from this
+# script's real location, so the folder can be moved anywhere (or on another
+# disk) without editing anything:
+#
+#   <suite>/bin/cloak-chrome     this script
+#   <suite>/bin/cloak-close      graceful shutdown (releases the license seat)
+#   <suite>/profiles/            one dir per profile
+#   <suite>/runtime/             patched Chromium builds + license key
+#   <suite>/npm/                 optional JS wrapper install
+#
+# Where <suite> is the parent of this script's directory. `~/.cloakbrowser`
+# must still resolve, because the patched Chromium hardcodes it; it is a
+# symlink to <suite>/runtime in this setup.
+#
+# Env overrides:
+#   CLOAK_ROOT          suite root        (default: this script's suite)
+#   CLOAK_PROFILES_DIR  profiles root     (default <suite>/profiles)
+#   CLOAK_RUNTIME_DIR   binary root       (default <suite>/runtime)
+#   CLOAK_PROFILE_NAME  profile to use    (default default)
+#   CLOAK_PLATFORM      windows|macos|linux   (default windows)
+#   CLOAK_PROXY         http://user:pass@host:port  (omit for no proxy)
+#   CLOAK_BINARY        explicit path to the chrome binary
+set -euo pipefail
+
+self=$(readlink -f "${BASH_SOURCE[0]}")
+suite=$(dirname "$(dirname "$self")")
+ROOT="${CLOAK_ROOT:-$suite}"
+PROFILES_DIR="${CLOAK_PROFILES_DIR:-$ROOT/profiles}"
+RUNTIME_DIR="${CLOAK_RUNTIME_DIR:-$ROOT/runtime}"
+profile_name="${CLOAK_PROFILE_NAME:-default}"
+passthrough=()
+list_only=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile|-p)
+      [[ $# -ge 2 ]] || { echo "--profile requires a name" >&2; exit 1; }
+      profile_name="$2"; shift 2 ;;
+    --profile=*)
+      profile_name="${1#*=}"; shift ;;
+    --list-profiles)
+      list_only=1; shift ;;
+    *)
+      passthrough+=("$1"); shift ;;
+  esac
+done
+
+# Names become directory paths — reject separators so a typo can't walk the tree.
+if [[ "$profile_name" == */* || "$profile_name" == "." || "$profile_name" == ".." ]]; then
+  echo "Invalid profile name: $profile_name" >&2
+  exit 1
+fi
+
+mkdir -p "$PROFILES_DIR"
+
+if (( list_only )); then
+  echo "Profiles in $PROFILES_DIR:"
+  found=0
+  for dir in "$PROFILES_DIR"/*/; do
+    [[ -d $dir ]] || continue
+    found=1
+    name=$(basename "$dir")
+    if [[ -f "$dir/.fingerprint-seed" ]]; then
+      seed=$(<"$dir/.fingerprint-seed")
+    else
+      seed="-"
+    fi
+    printf '  %-24s seed=%s\n' "$name" "$seed"
+  done
+  (( found )) || echo "  (none yet)"
+  exit 0
+fi
+
+profile="$PROFILES_DIR/$profile_name"
+mkdir -p "$profile"
+
+# Resolve the newest cached binary. Version dirs change on update, so glob
+# rather than hard-coding (e.g. chromium-151.0.7922.108.3-pro/chrome).
+if [[ -z "${CLOAK_BINARY:-}" ]]; then
+  candidates=()
+  for dir in "$RUNTIME_DIR" "$HOME/.cloakbrowser"; do
+    [[ -d "$dir" ]] || continue
+    shopt -s nullglob
+    candidates+=("$dir"/chromium-*/chrome)
+    shopt -u nullglob
+  done
+  if [[ ${#candidates[@]} -eq 0 && -n "${CLOAKBROWSER_BINARY_PATH:-}" ]]; then
+    candidates=("$CLOAKBROWSER_BINARY_PATH")
+  fi
+  if [[ ${#candidates[@]} -eq 0 ]]; then
+    echo "No cloakbrowser binary found under $RUNTIME_DIR or ~/.cloakbrowser." >&2
+    echo "Run: cloakbrowser install   (or set CLOAK_BINARY)" >&2
+    exit 1
+  fi
+  # Highest version wins; -pro sorts above the free build at the same version.
+  CLOAK_BINARY=$(printf '%s\n' "${candidates[@]}" | sort -V | tail -1)
+fi
+
+# The JS wrapper randomises the fingerprint seed on every launch. For a
+# persistent profile that is incoherent: cookies say "returning user" while the
+# device fingerprint changes each time. Pin one seed per profile instead.
+seed_file="$profile/.fingerprint-seed"
+if [[ ! -f "$seed_file" ]]; then
+  echo $((RANDOM % 90000 + 10000)) > "$seed_file"
+fi
+seed=$(<"$seed_file")
+
+# Per-profile hardware/identity flags. One flag per line; "#" starts a comment.
+# Kept as whole lines so values containing spaces (e.g. --fingerprint-gpu-renderer)
+# survive as a single argument.
+conf="$profile/fingerprint.conf"
+conf_args=()
+if [[ -f "$conf" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "$line" ]] && continue
+    conf_args+=("$line")
+  done < "$conf"
+fi
+
+# --- WM_CLASS -----------------------------------------------------------
+# Chromium's switch for the X11 window class is --class (switches::kWmClass).
+# Pin each profile's WM_CLASS to its name so a window manager can match the
+# window independently of the tab title. An explicit --class=... on the
+# command line or in fingerprint.conf wins; only inject when none was given.
+# Meaningful on Linux/X11 (or XWayland); skipped elsewhere.
+explicit_class=""
+for _a in "${conf_args[@]}" "${passthrough[@]}"; do
+  case "$_a" in
+    --class=*) explicit_class="${_a#--class=}" ;;
+    --class)    explicit_class="(custom)" ;;
+  esac
+done
+auto_class=""
+[[ -z "$explicit_class" && "$(uname -s)" == Linux ]] && auto_class="$profile_name"
+effective_class="${explicit_class:-$auto_class}"
+
+echo "profile: $profile_name  (seed=$seed, class=${effective_class:-none}, $profile)"
+(( ${#conf_args[@]} )) && echo "config:   $conf (${#conf_args[@]} flags)"
+
+args=(
+  --no-sandbox
+  --user-data-dir="$profile"
+  --fingerprint="$seed"
+  --fingerprint-platform="${CLOAK_PLATFORM:-windows}"
+)
+[[ -n "$auto_class" ]] && args+=(--class="$auto_class")
+[[ -n "${CLOAK_PROXY:-}" ]] && args+=(--proxy-server="$CLOAK_PROXY")
+
+# Config flags before CLI passthrough so an explicit command-line flag wins.
+#
+# The binary reports license denials as a bare exit code (76-79) with no
+# message, which makes a seat collision look like a silent failure. Run it as
+# a child so the code can be translated, and forward the shutdown signals the
+# browser treats as graceful.
+"$CLOAK_BINARY" "${args[@]}" "${conf_args[@]}" "${passthrough[@]}" &
+child=$!
+trap 'kill -TERM "$child" 2>/dev/null' INT TERM HUP
+rc=0
+wait "$child" || rc=$?
+trap - INT TERM HUP
+
+case "$rc" in
+  76) echo "cloak-chrome: license seat busy -- this plan runs 1 browser at a time." >&2
+      echo "              Another session is still active. Close it with 'cloak-close'," >&2
+      echo "              or wait out the lease (~10 min) if it was killed with kill -9." >&2 ;;
+  77) echo "cloak-chrome: license key invalid or missing (check CLOAKBROWSER_LICENSE_KEY)." >&2 ;;
+  78) echo "cloak-chrome: could not reach the license server; check the network/proxy." >&2 ;;
+  79) echo "cloak-chrome: $HOME/.cloakbrowser is missing or not writable." >&2 ;;
+esac
+exit "$rc"

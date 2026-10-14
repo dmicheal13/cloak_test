@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# cloak-close -- shut down CloakBrowser (cloak-chrome) gracefully, so the
+# license seat is handed back immediately instead of sitting in the server's
+# lease window.
+#
+#   cloak-close                    # close every running CloakBrowser
+#   cloak-close --profile game1    # close only that profile's browser
+#   cloak-close --browsers         # also close Playwright/Puppeteer-launched ones
+#   cloak-close --list             # show what would be closed, change nothing
+#   cloak-close --timeout 15       # how long to wait per process (default 30s)
+#
+# Why this exists: the patched Chromium holds one license seat through
+# /api/license/session/{start,heartbeat,end}. It calls .../end on any clean
+# shutdown -- SIGTERM, SIGINT (Ctrl-C), SIGHUP, closing the window, or CDP
+# Browser.close -- and that releases the seat within a second or two.
+# SIGKILL (kill -9, pkill -9, an OOM kill, a crash) skips that call, so the
+# seat stays occupied until the server-side lease expires (~10 min observed),
+# and meanwhile every new launch dies with exit code 76.
+#
+# Profile roots are found relative to this script, so the suite can be moved
+# anywhere. ~/cloak-profiles is still honoured when it is the live path.
+#
+# Env: CLOAK_PROFILES_DIR overrides the profile root (default <suite>/profiles).
+set -euo pipefail
+
+self=$(readlink -f "${BASH_SOURCE[0]}")
+suite=$(dirname "$(dirname "$self")")
+ROOT="${CLOAK_ROOT:-$suite}"
+profiles_dir="${CLOAK_PROFILES_DIR:-$ROOT/profiles}"
+timeout=30
+profile=""
+list_only=0
+all_browsers=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -p|--profile) profile="${2:?--profile requires a name}"; shift 2 ;;
+    -p=*|--profile=*) profile="${1#*=}"; shift ;;
+    -b|--browsers|--any) all_browsers=1; shift ;;
+    -t|--timeout) timeout="${2:?--timeout requires seconds}"; shift 2 ;;
+    -t=*|--timeout=*) timeout="${1#*=}"; shift ;;
+    -l|--list) list_only=1; shift ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    *) echo "cloak-close: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [[ -n "$profile" ]]; then
+  # Exact token match, so --profile game1 never catches game10.
+  pattern="--user-data-dir=(${profiles_dir}/${profile}|${HOME}/cloak-profiles/${profile})([[:space:]]|\$)"
+else
+  pattern="--user-data-dir=(${profiles_dir}|${HOME}/cloak-profiles)(/|[[:space:]]|\$)"
+fi
+
+mapfile -t pids < <(
+  set +e   # grep exits 1 when there is no match; that is not an error here
+  {
+    ps -eo pid=,args= | grep -E -- "$pattern" || true
+    # Wrapper-launched browsers (Playwright/Puppeteer) carry a temp user-data
+    # dir instead of a cloak profile, so match them on the binary path.
+    if (( all_browsers )); then
+      for dir in "$ROOT/runtime" "$HOME/.cloakbrowser"; do
+        [[ -d "$dir" ]] || continue
+        ps -eo pid=,args= | grep -E -- "(${dir}/chromium-[^ ]*/chrome)([[:space:]]|\$)" || true
+      done
+    fi
+  } | grep -v -- '--type=' | awk '{print $1}' | sort -u
+)
+
+if (( ${#pids[@]} == 0 )); then
+  echo "cloak-close: no running CloakBrowser found${profile:+ for profile \"$profile\"}."
+  (( all_browsers )) || echo "cloak-close: (wrapper-launched browsers need --browsers)" >&2
+  exit 0
+fi
+
+for pid in "${pids[@]}"; do
+  args=$(ps -p "$pid" -o args= | cut -c1-100)
+  if (( list_only )); then
+    echo "would close: pid $pid  $args"
+    continue
+  fi
+
+  echo "closing pid $pid  $args"
+  # SIGTERM is the graceful path: Chromium runs its normal shutdown, which is
+  # what fires the license session/end call.
+  kill -TERM "$pid"
+
+  waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if (( waited >= timeout )); then
+      echo "  still alive after ${timeout}s -- not escalating on purpose;" >&2
+      echo "  a hard kill here is what strands the license seat." >&2
+      break
+    fi
+    sleep 0.5
+    waited=$((waited + 1))
+  done
+  (( waited < timeout )) && echo "  closed (exited in $((waited / 2))s)"
+done
+
+(( list_only )) && exit 0
+((${#pids[@]})) || exit 0
+
+# Best-effort confirmation that the seats came back, when a key is on disk.
+key_file="$HOME/.cloakbrowser/license.key"
+if [[ -r "$key_file" ]]; then
+  key=$(<"$key_file")
+  body=$(curl -s --max-time 10 -X POST \
+    https://cloakbrowser.dev/api/license/session/count \
+    -H 'content-type: application/json' \
+    --data "{\"license_key\":\"$key\"}" || true)
+  if [[ "$body" =~ \"active\":([0-9]+),\"limit\":([0-9]+) ]]; then
+    echo "sessions: ${BASH_REMATCH[1]} in use, limit ${BASH_REMATCH[2]}"
+  fi
+fi
